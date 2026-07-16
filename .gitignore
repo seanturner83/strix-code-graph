@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Corporate-proxy CA certs are environment-specific — never commit them.
+sandbox/certs/*.pem
+sandbox/certs/*.crt
+
+# Local build/index artifacts
+*.scip
+*.sqlite

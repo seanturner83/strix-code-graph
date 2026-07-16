@@ -1,0 +1,64 @@
+[project]
+name = "strix-code-graph"
+version = "0.1.0"
+description = "SCIP code-graph addon for Strix: precise, cross-target symbol navigation (find_definition/find_references/find_implementations/grep) as agent tools."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+keywords = ["strix", "security", "scip", "code-graph", "code-intelligence"]
+dependencies = [
+  # Strix exposes the register_agent_tools hook + the @function_tool decorator
+  # (via openai-agents). Kept as a loose floor: the addon rides whatever Strix
+  # the deployment runs.
+  "strix-agent>=1.1.0",
+  # Vendored scip_pb2 modules need the protobuf runtime to parse SCIP indexes.
+  "protobuf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.11",
+]
+
+[project.entry-points."strix.addons"]
+# Lets a Strix that supports addon auto-discovery load us via entry point.
+# Harmless on a Strix that doesn't — bootstrap.register() is also callable
+# directly (and is a no-op unless STRIX_CODE_GRAPH is set).
+code_graph = "strix_code_graph.bootstrap:register"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["strix_code_graph"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "PTH", "RUF", "PERF", "TRY", "BLE", "LOG", "G"]
+ignore = [
+  "TRY003",  # long messages outside exception class
+  "G004",    # logging f-strings — matches the fork's style
+  # The indexer/query layers are ported verbatim from a battle-tested
+  # production fork; these are pure-style rules that fork did not enforce, and rewriting
+  # ~2900 lines of validated code to satisfy them adds risk for no behaviour
+  # gain. New addon code (tools/bootstrap/merge) is held to the full set above.
+  "PERF401",  # manual list-build vs comprehension (readability call in the fork)
+  "RUF005",   # iterable unpacking vs concatenation
+  "SIM108",   # ternary vs if/else
+  "SIM110",   # any()/all() vs loop
+  "RUF003",   # ambiguous unicode (× etc.) in ported comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Vendored generated protobuf stubs — never lint.
+"strix_code_graph/**/scip_pb2.py" = ["ALL"]
+"tests/**" = ["S101", "SLF001", "BLE001", "E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
