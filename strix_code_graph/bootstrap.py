@@ -38,8 +38,14 @@ from . import tools
 logger = logging.getLogger(__name__)
 
 # Where the sandbox-built SQLite index is copied out to on the runner. The
-# query tools read this via query.CodeGraphIndex.discover() → $STRIX_CODE_GRAPH_DIR.
-_ENV_DIR = "STRIX_CODE_GRAPH_DIR"
+# query tools read this via query.CodeGraphIndex.discover().
+#
+# Consumers set STRIX_CODE_GRAPH_PERSIST_DIR (the strix-scan pipeline's existing,
+# untouched contract — its harvest step relocates <dir>/target/ to the run's
+# code_graph/ for S3 + the enrich step). STRIX_CODE_GRAPH_DIR is accepted as an
+# alias for standalone/local use. First set wins; else a private tempdir.
+_ENV_DIRS = ("STRIX_CODE_GRAPH_PERSIST_DIR", "STRIX_CODE_GRAPH_DIR")
+_ENV_DIR = _ENV_DIRS[0]  # canonical name we (re-)export for the query tools
 # In-sandbox path the indexer writes to. MUST live under the workspace root:
 # the SDK's session.read() only permits reads inside /workspace
 # (InvalidManifestPathError otherwise), and copy-out reads the built sqlite back
@@ -49,8 +55,12 @@ _SANDBOX_SQLITE = f"{_SANDBOX_INDEX_DIR}/code_graph.sqlite"
 
 
 def enabled() -> bool:
-    """True when the addon is switched on (``STRIX_CODE_GRAPH`` truthy)."""
-    return os.environ.get("STRIX_CODE_GRAPH", "").strip().lower() in {"1", "true", "yes", "on"}
+    """True unless the addon is explicitly switched OFF (``STRIX_CODE_GRAPH``
+    falsy). Default-ON: this addon ships only in images built to run it, and its
+    sole consumers are our own scan pipelines — an opt-OUT is the right default
+    for us, and it removes the need to thread an enable flag through every
+    caller. Set STRIX_CODE_GRAPH=0/false/no/off to disable (e.g. local dev)."""
+    return os.environ.get("STRIX_CODE_GRAPH", "1").strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 def register() -> bool:
@@ -192,17 +202,28 @@ async def _build_and_copy_out(session: Any, subdirs: list[str]) -> None:
             logger.warning("strix-code-graph: merge produced no index; unavailable")
             return
 
-        out_dir = Path(os.environ.get(_ENV_DIR) or tempfile.mkdtemp(prefix="strix-code-graph-"))
-        os.environ[_ENV_DIR] = str(out_dir)
-        (out_dir / "index").mkdir(parents=True, exist_ok=True)
+        # Resolve the copy-out dir from the first env name a consumer set
+        # (STRIX_CODE_GRAPH_PERSIST_DIR — the pipeline's contract — then the
+        # _DIR alias), else a private tempdir. Re-export ALL names so the query
+        # tools (and any downstream) discover the same dir regardless of which
+        # they read.
+        configured = next((os.environ[n] for n in _ENV_DIRS if os.environ.get(n)), None)
+        out_dir = Path(configured or tempfile.mkdtemp(prefix="strix-code-graph-"))
+        for n in _ENV_DIRS:
+            os.environ[n] = str(out_dir)
+        # Write to <dir>/target/ — the layout the strix-scan pipeline's harvest
+        # + enrich steps expect (code_graph/target/code_graph.sqlite), matching
+        # the prior fork-carried indexer. (Was <dir>/index/, which no consumer
+        # looked in → index never persisted.)
+        (out_dir / "target").mkdir(parents=True, exist_ok=True)
         data = await _read_all(session, _SANDBOX_SQLITE)
         if data is None:
             logger.warning("strix-code-graph: merged index built but copy-out failed; unavailable")
             return
-        (out_dir / "index" / "code_graph.sqlite").write_bytes(data)
+        (out_dir / "target" / "code_graph.sqlite").write_bytes(data)
         logger.info(
             "strix-code-graph: unified index ready (%d target(s), %d bytes) at %s",
-            len(subdirs), len(data), out_dir / "index" / "code_graph.sqlite",
+            len(subdirs), len(data), out_dir / "target" / "code_graph.sqlite",
         )
     except Exception as exc:  # noqa: BLE001 — never let code-graph break a scan
         logger.warning("strix-code-graph: index build/merge/copy-out failed (%s); unavailable", exc)

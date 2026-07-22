@@ -551,7 +551,16 @@ class CodeGraphIndex:
         "code graph unavailable" when the index build was skipped or failed.
         """
         if root is None:
-            root = Path(os.environ.get("STRIX_CODE_GRAPH_DIR", "strix_code_graph"))
+            # Honour either env name a consumer set: the strix-scan pipeline
+            # uses STRIX_CODE_GRAPH_PERSIST_DIR; standalone/local use the _DIR
+            # alias. bootstrap re-exports both to the same dir, but a query tool
+            # in a fresh process must resolve independently. First set wins.
+            configured = (
+                os.environ.get("STRIX_CODE_GRAPH_PERSIST_DIR")
+                or os.environ.get("STRIX_CODE_GRAPH_DIR")
+                or "strix_code_graph"
+            )
+            root = Path(configured)
         if not root.exists():
             return None
         candidates = sorted(
