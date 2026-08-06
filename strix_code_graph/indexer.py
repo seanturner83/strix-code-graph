@@ -287,7 +287,28 @@ def _index_go(target: Path, out_dir: Path) -> Path | None:
         )
         logger.info("code_graph: scip-go offline via warm GOMODCACHE=%s", modcache)
     _run(["scip-go", "--output", str(out)], cwd=target, env=go_env)
-    return out if out.exists() else None
+    if not out.exists():
+        logger.warning(
+            "code_graph: scip-go produced no output for %s (exit 0 but no index file) "
+            "— Go code-graph will be ABSENT for this target", target,
+        )
+        return None
+    # scip-go exits 0 even when go/packages failed to load the target's imports
+    # (the common private-dep-unresolved case), leaving a near-empty SCIP that
+    # yields a location-less graph. Surface that loudly instead of silently
+    # shipping an empty index — a bare-header .scip is only a few hundred bytes,
+    # whereas a real module's index is KB-to-MB. Threshold is deliberately low
+    # (heuristic, not a parse) so it only fires on the truly-empty case.
+    _size = out.stat().st_size
+    if _size < 512:
+        logger.warning(
+            "code_graph: scip-go index for %s is suspiciously small (%d bytes) — "
+            "likely unresolved deps (check GOPROXY/GOMODCACHE reached the sandbox). "
+            "Go findings may land location-less.", target, _size,
+        )
+    else:
+        logger.info("code_graph: scip-go index built for %s (%d bytes)", target, _size)
+    return out
 
 
 def _index_python(target: Path, out_dir: Path) -> Path | None:
