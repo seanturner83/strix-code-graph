@@ -255,29 +255,47 @@ def _index_go(target: Path, out_dir: Path) -> Path | None:
     if not _binary_exists("scip-go"):
         raise IndexerError("scip-go missing from sandbox")
     out = out_dir / "go.scip"
-    # GOTOOLCHAIN=local forces Go to use the toolchain baked into the
-    # sandbox instead of honouring the target go.mod's `go 1.x.y` pin,
-    # which triggers an on-demand toolchain DOWNLOAD. That download fails
-    # in our sandbox because GOSUMDB=off makes Go refuse to verify the
-    # toolchain module's checksum ("checksum database disabled by
-    # GOSUMDB=off") — so the whole SCIP index silently skips and every Go
-    # finding lands location-less. The baked toolchain indexes fine
-    # regardless of the repo's go-directive; scip-go only needs to parse +
-    # type-check, not match the exact patch release. Observed on
-    # global-policy-engine#10 (go.mod pinned go1.26.4) 2026-06-15.
-    go_env = {"GOTOOLCHAIN": "local"}
-    # Private-dep resolution: real fleet repos vendor nothing and pull dozens
-    # of private github.com/<org>/* modules, but the sandbox is SEALED (no VCS
-    # auth, no network). scip-go type-checks with go/packages, so unresolved
-    # deps yield an EMPTY index. Fix: point GOMODCACHE at a warm module cache
-    # pre-populated out-of-band (locally a bind-mount; on the fleet the same S3
-    # warm cache the dependency-drain already maintains) and force fully
-    # offline resolution so Go reads only from that cache. Opt-in via
-    # STRIX_GO_MODCACHE (a sandbox path); absent = today's behaviour unchanged.
+    # Toolchain selection. Go enforces the target go.mod's `go 1.x.y` directive
+    # as a HARD FLOOR: a lower baked toolchain is rejected outright
+    #   "go.mod requires go >= 1.26.5 (running go 1.26.4; GOTOOLCHAIN=local)"
+    # BEFORE any type-check, so scip-go's go/packages load fails and the index
+    # is empty (scip-go still exits 0 → silently swallowed). A repo bumping past
+    # the baked patch release therefore loses its whole code-graph. This bit the
+    # fleet when repos moved to go 1.26.5 while the sandbox baked 1.26.4
+    # (connection-service etc., graphs vanished ~2026-07-22).
+    #
+    # We used to force GOTOOLCHAIN=local to avoid an on-demand toolchain
+    # DOWNLOAD — but that was the wrong lever: `local` blocks legitimately-newer
+    # toolchains, and the download only failed because GOSUMDB=off ALSO disables
+    # verification of the toolchain module itself ("checksum database disabled
+    # by GOSUMDB=off"). The fix is GOTOOLCHAIN=auto with GOSUMDB at its DEFAULT
+    # (sum.golang.org) so Go can fetch + verify the pinned toolchain via GOPROXY,
+    # while GOPRIVATE still exempts our private modules from sum checks. Proven
+    # locally: connection-service (go 1.26.5) built an 8.6MB go.scip this way,
+    # vs zero bytes under GOTOOLCHAIN=local. GOPROXY/GOPRIVATE arrive from the
+    # orchestrator env (forwarded into the sandbox at container-create).
+    go_env = {"GOTOOLCHAIN": "auto"}
+    # CRITICAL: force GOSUMDB back ON (default sum.golang.org). The composite
+    # exports GOSUMDB=off and session_manager forwards it into the sandbox — but
+    # GOSUMDB=off disables verification of the TOOLCHAIN module too, which makes
+    # the on-demand `go1.x.y` download fail ("checksum database disabled by
+    # GOSUMDB=off"). We must override the inherited off here, not merely refrain
+    # from setting it, or _run's {**os.environ, **env} merge lets the forwarded
+    # off win. Private modules are exempted from sum checks via GOPRIVATE (they
+    # have no public sum-db entry); the public toolchain + public deps verify.
+    go_env["GOSUMDB"] = "sum.golang.org"
+    go_env["GOPRIVATE"] = os.environ.get("GOPRIVATE", "github.com/seedcx/*")
+    go_env["GONOSUMCHECK"] = "1"
+    # Private-dep resolution via a warm module cache (fully offline) stays as an
+    # opt-in override: when STRIX_GO_MODCACHE is set we read ONLY from that cache
+    # and skip the network/proxy path entirely (GOPROXY=off). Here GOSUMDB=off is
+    # safe because a warm cache implies the toolchain is already present locally
+    # (no toolchain module to verify).
     modcache = os.environ.get("STRIX_GO_MODCACHE", "").strip()
     if modcache:
         go_env.update(
             {
+                "GOTOOLCHAIN": "local",
                 "GOMODCACHE": modcache,
                 "GOFLAGS": "-mod=mod",
                 "GOPROXY": "off",  # read only from the warm cache, never network
