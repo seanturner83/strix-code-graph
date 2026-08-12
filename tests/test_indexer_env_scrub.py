@@ -45,6 +45,10 @@ def test_scrubbed_env_keeps_non_credential_vars(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("HOME", "/home/pentester")
     monkeypatch.setenv("GOPROXY", "https://proxy.golang.org")
     monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("JAVA_HOME", "/usr/lib/jvm/java-21")
+    monkeypatch.setenv("GRADLE_USER_HOME", "/home/pentester/.gradle")
+    monkeypatch.setenv("MAVEN_OPTS", "-Xmx512m")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:8080")
 
     scrubbed = indexer._scrubbed_env()
 
@@ -52,6 +56,28 @@ def test_scrubbed_env_keeps_non_credential_vars(monkeypatch: pytest.MonkeyPatch)
     assert scrubbed.get("HOME") == "/home/pentester"
     assert scrubbed.get("GOPROXY") == "https://proxy.golang.org"
     assert scrubbed.get("LANG") == "en_US.UTF-8"
+    assert scrubbed.get("JAVA_HOME") == "/usr/lib/jvm/java-21"
+    assert scrubbed.get("GRADLE_USER_HOME") == "/home/pentester/.gradle"
+    assert scrubbed.get("MAVEN_OPTS") == "-Xmx512m"
+    assert scrubbed.get("http_proxy") == "http://127.0.0.1:8080"
+
+
+def test_scrubbed_env_drops_url_shaped_and_bare_key_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Push-review findings (2026-08-12): the original pattern list missed
+    URL-embedded creds (postgres://user:pass@host-style) and bare KEY names
+    without an underscore (APIKEY, SSHKEY)."""
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:hunter2@db:5432/app")
+    monkeypatch.setenv("WEBHOOK_URL", "https://hooks.example.com/t/signing-tok")
+    monkeypatch.setenv("SENTRY_DSN", "https://key@sentry.io/123")
+    monkeypatch.setenv("STRIPE_APIKEY", "sk_live_abc")
+    monkeypatch.setenv("DEPLOY_SSHKEY", "-----BEGIN OPENSSH-----")
+
+    scrubbed = indexer._scrubbed_env()
+
+    for leaked in ("DATABASE_URL", "WEBHOOK_URL", "SENTRY_DSN", "STRIPE_APIKEY", "DEPLOY_SSHKEY"):
+        assert leaked not in scrubbed, f"{leaked} survived the scrub"
 
 
 def test_run_base_env_replaces_rather_than_merges(monkeypatch: pytest.MonkeyPatch) -> None:

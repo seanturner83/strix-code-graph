@@ -69,7 +69,18 @@ class IndexerError(RuntimeError):
 # executing the target's own build code, so they're outside this threat
 # model. If that changes (e.g. Go gets an install step that runs target
 # code), revisit.
-_SECRET_ENV_PATTERNS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "_KEY", "AUTH")
+#
+# _URL/_URI/_DSN/WEBHOOK cover the other common credential shape: a secret
+# embedded in a connection string (postgres://user:pass@host, a webhook URL
+# with a signing token in the path) rather than a bare token value. KEY
+# (not just _KEY) also catches APIKEY/SSHKEY/KEYSTORE-style names without an
+# underscore separator — checked against the sandbox's actual non-credential
+# vars (PATH, HOME, JAVA_HOME, GRADLE_USER_HOME, MAVEN_OPTS, GOPROXY,
+# http_proxy/https_proxy) to confirm none of them collide.
+_SECRET_ENV_PATTERNS = (
+    "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "KEY", "AUTH",
+    "_URL", "_URI", "_DSN", "WEBHOOK",
+)
 
 
 def _scrubbed_env() -> dict[str, str]:
@@ -527,12 +538,19 @@ def _index_java(target: Path, out_dir: Path) -> Path | None:
     if not _binary_exists("scip-java"):
         raise IndexerError("scip-java missing from sandbox")
     out = out_dir / "java.scip"
+    # APPSEC-1396: scip-java drives the TARGET's own Maven/Gradle build (see
+    # docstring) — Maven plugins and Gradle build scripts execute arbitrary
+    # code during that resolve/compile, same class of risk as _index_python's
+    # pip/uv and _index_rust's rust-analyzer-scip pass. Missed in the initial
+    # sweep (caught by push-review); scrub here too.
+    #
     # scip-java writes index.scip into the cwd by default; pin --output so it
     # lands in out_dir alongside the other legs' artifacts.
     _run(
         ["scip-java", "index", "--output", str(out)],
         cwd=target,
         timeout=900,
+        base_env=_scrubbed_env(),
     )
     return out if out.exists() else None
 
