@@ -43,6 +43,47 @@ class IndexerError(RuntimeError):
     """Raised when an indexer tool fails or is missing from the sandbox."""
 
 
+# APPSEC-1396: the sandbox env carries real secrets forwarded in for
+# legitimate reasons — NPM_TOKEN/NODE_AUTH_TOKEN for private npm scopes,
+# CARGO_REGISTRIES_*_TOKEN for private crates, TOOL_SERVER_TOKEN for the
+# in-sandbox tool-execution API. The install/build steps below
+# (_index_python's uv/pip, _index_rust's rust-analyzer-scip metadata pass,
+# _index_typescript's npm install) execute the TARGET repo's own build
+# backend — setup.py, build.rs/proc-macros, npm lifecycle scripts — and
+# Strix's whole premise is that target is potentially attacker-controlled.
+# Confirmed dynamically, both via the ticket's own PoC and live re-verification
+# (2026-08-12): a planted setup.py read NPM_TOKEN/TOOL_SERVER_TOKEN straight
+# out of os.environ during `pip install -e .`; a planted build.rs did the same
+# during `rust-analyzer scip` — no exploit needed beyond "the value is
+# sitting in the env".
+#
+# Fix: scrub by NAME PATTERN, not an enumerated list. An enumerated list
+# (matching just the vars named in the ticket) rots the moment someone adds
+# a new credential to the sandbox env — it protects against last quarter's
+# secrets, not next quarter's. Substring-matching on credential-shaped names
+# fails safe: a false positive just costs an installer a var it likely didn't
+# need for public-registry resolution anyway; a false negative is the
+# actual danger. Deliberately NOT included: GOPROXY/GOPRIVATE/GOSUMDB —
+# these are proxy URLs/hostname-prefix config the Go leg (_index_go) uses,
+# not credentials, and _index_go type-checks via go/packages rather than
+# executing the target's own build code, so they're outside this threat
+# model. If that changes (e.g. Go gets an install step that runs target
+# code), revisit.
+_SECRET_ENV_PATTERNS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "_KEY", "AUTH")
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Copy of os.environ with credential-shaped vars removed — pass as the
+    base env to any subprocess that runs the TARGET repo's own build/install
+    code. PATH/HOME/etc are untouched; only names matching a credential
+    pattern (case-insensitive) are dropped."""
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not any(pat in k.upper() for pat in _SECRET_ENV_PATTERNS)
+    }
+
+
 @dataclass(frozen=True)
 class IndexResult:
     target_dir: Path
@@ -66,10 +107,17 @@ def _run(
     cwd: Path | None = None,
     timeout: int = 600,
     env: dict[str, str] | None = None,
+    base_env: dict[str, str] | None = None,
 ) -> None:
+    """base_env, when given, REPLACES os.environ as the base (env, if also
+    given, still layers on top) — used to run a command against the
+    _scrubbed_env() base rather than the full environment. env alone stays
+    additive-onto-os.environ, unchanged for every existing caller."""
     logger.info("code_graph: running %s (cwd=%s)", " ".join(cmd), cwd)
     run_env = None
-    if env:
+    if base_env is not None:
+        run_env = {**base_env, **(env or {})}
+    elif env:
         run_env = {**os.environ, **env}
     proc = subprocess.run(
         cmd,
@@ -219,8 +267,15 @@ def _index_typescript(target: Path, out_dir: Path) -> Path | None:
             install_cmd = ["sh", "-c", wrapped]
         else:
             install_cmd = base_args
+        # APPSEC-1396: --ignore-scripts already blocks npm's main RCE vector
+        # (pre/postinstall lifecycle scripts), so this isn't currently an
+        # open code-execution path the way Python/Rust's installs are. Scrub
+        # anyway for defense-in-depth — a future change dropping
+        # --ignore-scripts, or an npm bug, shouldn't silently reopen
+        # credential exposure here too.
+        scrubbed = _scrubbed_env()
         try:
-            _run(install_cmd, cwd=target, timeout=300)
+            _run(install_cmd, cwd=target, timeout=300, base_env=scrubbed)
         except IndexerError as exc:
             logger.warning(
                 "code_graph: npm install (engine-strict default) failed (%s); "
@@ -237,7 +292,7 @@ def _index_typescript(target: Path, out_dir: Path) -> Path | None:
             else:
                 fallback_cmd = fallback_args
             try:
-                _run(fallback_cmd, cwd=target, timeout=300)
+                _run(fallback_cmd, cwd=target, timeout=300, base_env=scrubbed)
             except IndexerError as exc2:
                 logger.warning(
                     "code_graph: npm install fallback (--engine-strict=false) also "
@@ -314,6 +369,10 @@ def _index_python(target: Path, out_dir: Path) -> Path | None:
     has_requirements = (target / "requirements.txt").exists()
 
     if not has_venv:
+        # APPSEC-1396: this install step runs the TARGET's own build backend
+        # (setup.py / PEP517 hooks) — scrub credential-shaped env vars so a
+        # malicious target can't read them, same as _index_rust/_index_typescript.
+        scrubbed = _scrubbed_env()
         try:
             if has_pyproject and _binary_exists("uv"):
                 # uv is 10-100x faster than pip; prefer it when present.
@@ -321,17 +380,20 @@ def _index_python(target: Path, out_dir: Path) -> Path | None:
                     ["uv", "sync", "--no-dev", "--frozen"],
                     cwd=target,
                     timeout=300,
+                    base_env=scrubbed,
                 )
             elif has_pyproject:
                 _run(
                     ["pip", "install", "--no-deps", "-e", "."],
                     cwd=target,
                     timeout=300,
+                    base_env=scrubbed,
                 )
             elif has_requirements:
                 _run(
                     ["pip", "install", "-r", "requirements.txt"],
                     cwd=target,
+                    base_env=scrubbed,
                     timeout=300,
                 )
         except IndexerError as exc:
@@ -412,12 +474,22 @@ def _index_rust(target: Path, out_dir: Path) -> Path | None:
     rust_analyzer = f"{cargo_bin}/rust-analyzer"
     cargo = f"{cargo_bin}/cargo"
 
+    # APPSEC-1396: `rust-analyzer scip` below runs the target's build.rs /
+    # proc-macros as part of its own metadata pass — confirmed live
+    # (2026-08-12): a crate with a build.rs that reads os.environ leaked the
+    # var on an unscrubbed run, and stopped leaking once base_env=scrubbed
+    # was applied to this same call. `cargo fetch` alone does NOT trigger
+    # build.rs (verified: no execution) — it only downloads crate sources —
+    # so it's scrubbed here purely for consistency/defense-in-depth, not
+    # because it's independently exploitable.
+    scrubbed = _scrubbed_env()
+
     # Pre-fetch the crate graph. rust-analyzer's metadata pass would
     # otherwise stall on network; pulling crates explicitly with a
     # tight timeout fails fast on network issues without blocking
     # the indexer indefinitely.
     try:
-        _run([cargo, "fetch"], cwd=target, timeout=300)
+        _run([cargo, "fetch"], cwd=target, timeout=300, base_env=scrubbed)
     except IndexerError as exc:
         logger.warning(
             "code_graph: cargo fetch failed (%s); rust-analyzer may emit "
@@ -430,6 +502,7 @@ def _index_rust(target: Path, out_dir: Path) -> Path | None:
         [rust_analyzer, "scip", str(target), "--output", str(out)],
         cwd=target,
         timeout=600,
+        base_env=scrubbed,
     )
     return out if out.exists() else None
 
