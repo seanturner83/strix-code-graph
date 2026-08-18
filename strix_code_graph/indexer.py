@@ -143,8 +143,15 @@ def _run(
         env=run_env,
     )
     if proc.returncode != 0:
+        # (stderr or stdout): some tools (e.g. scip-typescript's "no files
+        # got indexed" diagnostic) write their real error text to stdout,
+        # not stderr -- stderr-only capture here silently discarded it,
+        # reporting a blank message for a genuinely informative failure.
+        # Same fallback idiom build_corpus_graph.py already uses for its
+        # own tool-error detail.
         raise IndexerError(
-            f"command {cmd!r} failed (rc={proc.returncode}): {proc.stderr[:500]}"
+            f"command {cmd!r} failed (rc={proc.returncode}): "
+            f"{(proc.stderr or proc.stdout)[:500]}"
         )
 
 
@@ -269,13 +276,20 @@ def _index_typescript(target: Path, out_dir: Path) -> Path | None:
     # hook after the indexer returns, so downstream tools (agent
     # loop, etc.) never see the installed deps.
     if not (target / "node_modules").exists() and (target / "package.json").exists():
-        # Fallback chain for npm install:
+        # Fallback chain for npm install, each tier layered on the last:
         #   1. Try to match Node version from package.json engines.node.
         #      Many repos pin a specific node (e.g. "22.15.0") and npm
         #      refuses install with EBADENGINE on mismatch.
         #   2. If install still fails, retry with --engine-strict=false
         #      to bypass the engine check entirely.
-        #   3. If THAT also fails, log + proceed without deps;
+        #   3. If THAT also fails, retry with --legacy-peer-deps too --
+        #      a DIFFERENT failure mode (ERESOLVE peer-dependency
+        #      conflicts, e.g. a repo pinning an old ts-node alongside a
+        #      newer typeorm that peer-requires a newer one) that
+        #      --engine-strict=false does nothing for; live-observed:
+        #      the exact same ERESOLVE error persisted through tier 2
+        #      unchanged.
+        #   4. If THAT also fails, log + proceed without deps;
         #      scip-typescript will run on the bare tree and produce
         #      partial output (or fail; indexer module exits 0 either
         #      way per the warn-and-continue policy).
@@ -288,17 +302,15 @@ def _index_typescript(target: Path, out_dir: Path) -> Path | None:
             "--no-fund",
             "--prefer-offline",
         ]
-        # If we resolved a node bin, wrap cmd in sh -c to prepend its
-        # bin dir to PATH for the subprocess (subprocess.run env doesn't
-        # shell-expand $PATH).
-        if node_bin:
-            wrapped = (
-                f"export PATH={node_bin}:$PATH; "
-                + " ".join(base_args)
-            )
-            install_cmd = ["sh", "-c", wrapped]
-        else:
-            install_cmd = base_args
+
+        def _npm_cmd(extra_args: list[str]) -> list[str]:
+            args = base_args + extra_args
+            if not node_bin:
+                return args
+            # Prepend the resolved node's bin dir to PATH for the
+            # subprocess (subprocess.run env doesn't shell-expand $PATH).
+            return ["sh", "-c", f"export PATH={node_bin}:$PATH; " + " ".join(args)]
+
         # APPSEC-1396: --ignore-scripts already blocks npm's main RCE vector
         # (pre/postinstall lifecycle scripts), so this isn't currently an
         # open code-execution path the way Python/Rust's installs are. Scrub
@@ -306,30 +318,24 @@ def _index_typescript(target: Path, out_dir: Path) -> Path | None:
         # --ignore-scripts, or an npm bug, shouldn't silently reopen
         # credential exposure here too.
         scrubbed = _scrubbed_env()
-        try:
-            _run(install_cmd, cwd=target, timeout=300, base_env=scrubbed)
-        except IndexerError as exc:
-            logger.warning(
-                "code_graph: npm install (engine-strict default) failed (%s); "
-                "retrying with --engine-strict=false",
-                exc,
-            )
-            fallback_args = base_args + ["--engine-strict=false"]
-            if node_bin:
-                fallback_cmd = [
-                    "sh",
-                    "-c",
-                    f"export PATH={node_bin}:$PATH; " + " ".join(fallback_args),
-                ]
-            else:
-                fallback_cmd = fallback_args
+        tiers = [
+            ("default", []),
+            ("--engine-strict=false", ["--engine-strict=false"]),
+            (
+                "--engine-strict=false --legacy-peer-deps",
+                ["--engine-strict=false", "--legacy-peer-deps"],
+            ),
+        ]
+        for i, (label, extra_args) in enumerate(tiers):
             try:
-                _run(fallback_cmd, cwd=target, timeout=300, base_env=scrubbed)
-            except IndexerError as exc2:
+                _run(_npm_cmd(extra_args), cwd=target, timeout=300, base_env=scrubbed)
+                break
+            except IndexerError as exc:
+                is_last = i == len(tiers) - 1
                 logger.warning(
-                    "code_graph: npm install fallback (--engine-strict=false) also "
-                    "failed (%s); indexing without deps",
-                    exc2,
+                    "code_graph: npm install (%s) failed (%s); %s",
+                    label, exc,
+                    "indexing without deps" if is_last else "retrying with next fallback tier",
                 )
     out = out_dir / "ts.scip"
     # --infer-tsconfig: scip-typescript's own built-in synthesis for repos
