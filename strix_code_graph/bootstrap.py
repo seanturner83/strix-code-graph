@@ -220,13 +220,60 @@ async def _build_and_copy_out(session: Any, subdirs: list[str]) -> None:
         if data is None:
             logger.warning("strix-code-graph: merged index built but copy-out failed; unavailable")
             return
-        (out_dir / "target" / "code_graph.sqlite").write_bytes(data)
+        final_sqlite = out_dir / "target" / "code_graph.sqlite"
+        final_sqlite.write_bytes(data)
         logger.info(
             "strix-code-graph: unified index ready (%d target(s), %d bytes) at %s",
-            len(subdirs), len(data), out_dir / "target" / "code_graph.sqlite",
+            len(subdirs), len(data), final_sqlite,
         )
+        _maybe_merge_corpus_graph(final_sqlite)
     except Exception as exc:  # noqa: BLE001 — never let code-graph break a scan
         logger.warning("strix-code-graph: index build/merge/copy-out failed (%s); unavailable", exc)
+
+
+def _maybe_merge_corpus_graph(session_sqlite: Path) -> None:
+    """If STRIX_CORPUS_GRAPH_PATH points at a pre-fetched, corpus-wide merged
+    index, UNION it into this session's own fresh graph in place — so
+    find_definition/find_references resolve cross-repo edges against the
+    WHOLE org corpus, not just this scan's own target(s).
+
+    A separate, standalone job (seedcx/strix-scan-workflow's
+    build_corpus_graph.py) builds and publishes that index to S3; this addon
+    stays AWS-free (same posture as cache.py's own docstring) by never
+    fetching it itself -- the wrapping CI workflow downloads it to a local
+    path BEFORE invoking Strix and sets this env var, exactly the same
+    runner-local-path convention STRIX_CODE_GRAPH_PERSIST_DIR already uses.
+
+    Best-effort: unset env, a missing file, or a merge failure all degrade
+    to "use the session-only graph" -- never breaks the scan.
+    """
+    corpus_path = os.environ.get("STRIX_CORPUS_GRAPH_PATH", "").strip()
+    if not corpus_path:
+        return
+    corpus_sqlite = Path(corpus_path)
+    if not corpus_sqlite.is_file():
+        logger.info(
+            "strix-code-graph: STRIX_CORPUS_GRAPH_PATH set but no file at %s; "
+            "using session-only index", corpus_sqlite,
+        )
+        return
+    try:
+        from .indexer import merge_sqlite_indexes
+
+        # "" keeps the session's own graph's paths bare (unprefixed, exactly
+        # as they already are); "corpus" prefixes the pre-built graph's
+        # paths so they never collide with the session's own repo(s).
+        merged = session_sqlite.with_name("code_graph.with-corpus.sqlite")
+        merge_sqlite_indexes([("", session_sqlite), ("corpus", corpus_sqlite)], merged)
+        merged.replace(session_sqlite)
+        logger.info(
+            "strix-code-graph: merged corpus-wide graph (%s) into session index",
+            corpus_sqlite,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the scan over this
+        logger.warning(
+            "strix-code-graph: corpus-graph merge failed (%s); using session-only index", exc,
+        )
 
 
 async def _read_all(session: Any, remote_path: str) -> bytes | None:
