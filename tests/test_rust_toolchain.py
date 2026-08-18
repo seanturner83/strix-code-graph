@@ -100,3 +100,47 @@ def test_ensure_rust_toolchain_returns_none_when_binary_still_missing(
     monkeypatch.setattr(indexer, "_run", lambda *a, **kw: None)
 
     assert indexer._ensure_rust_toolchain() is None
+
+
+def test_index_rust_passes_matching_cargo_and_rustup_home_to_cargo_fetch_and_scip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: cargo/rust-analyzer are rustup PROXY binaries that resolve
+    the active toolchain via CARGO_HOME/RUSTUP_HOME at RUN time, not just at
+    install time. _ensure_rust_toolchain's install only set these for its OWN
+    subprocess calls -- _index_rust's later cargo-fetch/rust-analyzer-scip
+    calls used base_env=scrubbed with no env= override, so on any host where
+    _cargo_home() differs from rustup's own default ($HOME/.rustup) -- e.g.
+    CARGO_HOME pointed at a CI workspace dir -- those calls silently resolved
+    against the WRONG (empty) toolchain root and failed with "Unknown binary
+    'rust-analyzer' in official toolchain ...". Never surfaced against the
+    sandbox's hardcoded /home/pentester default because HOME was already
+    /home/pentester there too.
+    """
+    monkeypatch.setenv("CARGO_HOME", str(tmp_path / ".cargo"))
+    cargo_bin = tmp_path / ".cargo" / "bin"
+    cargo_bin.mkdir(parents=True)
+    (cargo_bin / "rust-analyzer").write_text("#!/bin/sh\n")
+
+    target = tmp_path / "some-crate"
+    target.mkdir()
+    (target / "Cargo.toml").write_text("[package]\nname = \"foo\"\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    calls = []
+
+    def _fake_run(cmd, cwd=None, timeout=600, env=None, base_env=None):
+        calls.append({"cmd": cmd, "env": env})
+        if cmd[0] == cargo_bin / "rust-analyzer" or (isinstance(cmd[0], str) and cmd[0].endswith("rust-analyzer")):
+            (out_dir / "rs.scip").write_bytes(b"fake scip")
+
+    monkeypatch.setattr(indexer, "_run", _fake_run)
+    indexer._index_rust(target, out_dir)
+
+    assert len(calls) == 2  # cargo fetch, then rust-analyzer scip
+    for c in calls:
+        assert c["env"] == {
+            "CARGO_HOME": str(tmp_path / ".cargo"),
+            "RUSTUP_HOME": str(tmp_path / ".rustup"),
+        }

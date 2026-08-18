@@ -518,12 +518,28 @@ def _index_rust(target: Path, out_dir: Path) -> Path | None:
     # because it's independently exploitable.
     scrubbed = _scrubbed_env()
 
+    # rust-analyzer/cargo are rustup PROXY binaries — they resolve the
+    # active toolchain via CARGO_HOME/RUSTUP_HOME at RUN time, not just at
+    # install time. _ensure_rust_toolchain's install only set these for its
+    # OWN subprocess calls (env=, additive-only, never persisted into this
+    # process's os.environ) — CARGO_HOME rides along in _scrubbed_env() for
+    # free (any caller with it set as a real process env var, e.g. this
+    # job's own step-level env, keeps it), but RUSTUP_HOME never did, so a
+    # non-default _cargo_home() (anything but /home/pentester) left these
+    # proxy calls resolving against rustup's own default $HOME/.rustup --
+    # empty on a bare runner -- and failing with "Unknown binary
+    # 'rust-analyzer' in official toolchain ...". Pass both explicitly,
+    # layered on top of scrubbed via _run's env= (never a security concern:
+    # these are directory paths, not secrets).
+    home = _cargo_home()
+    toolchain_env = {"CARGO_HOME": str(home / ".cargo"), "RUSTUP_HOME": str(home / ".rustup")}
+
     # Pre-fetch the crate graph. rust-analyzer's metadata pass would
     # otherwise stall on network; pulling crates explicitly with a
     # tight timeout fails fast on network issues without blocking
     # the indexer indefinitely.
     try:
-        _run([cargo, "fetch"], cwd=target, timeout=300, base_env=scrubbed)
+        _run([cargo, "fetch"], cwd=target, timeout=300, base_env=scrubbed, env=toolchain_env)
     except IndexerError as exc:
         logger.warning(
             "code_graph: cargo fetch failed (%s); rust-analyzer may emit "
@@ -537,6 +553,7 @@ def _index_rust(target: Path, out_dir: Path) -> Path | None:
         cwd=target,
         timeout=600,
         base_env=scrubbed,
+        env=toolchain_env,
     )
     return out if out.exists() else None
 
