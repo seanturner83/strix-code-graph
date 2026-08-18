@@ -694,6 +694,33 @@ def _index_k8s(target: Path, out_dir: Path) -> Path | None:
         return None
 
 
+def _index_protobuf(target: Path, out_dir: Path) -> Path | None:
+    """SCIP index for Protobuf/Buf schemas via the scip_protobuf bridge
+    (drives `buf build`). Detection: any *.proto. Returns None when there's
+    no protobuf or the buf CLI is unavailable — degrades cleanly like the
+    other legs. Closes the schema-repo code-graph gap: repos that define
+    shared message/service contracts (e.g. assets-messages) but commit no
+    generated code have zero other language marker and were previously
+    100% invisible to the graph."""
+    if not _has_files_matching(target, "*.proto"):
+        return None
+    if not _binary_exists("buf"):
+        # Not a hard error: the sandbox may predate the buf install;
+        # degrade to no-proto-index rather than fail the run.
+        logger.warning("code_graph: buf missing; skipping protobuf index")
+        return None
+    try:
+        # Import inside the try (see _index_terraform): scip_protobuf pulls
+        # in the vendored scip_pb2; any import-time error stays contained
+        # to this leg instead of killing indexing for every language.
+        from .scip_protobuf import index as proto_index
+
+        return proto_index(target, out_dir)
+    except Exception as exc:  # noqa: BLE001 — indexer must never break the scan
+        logger.warning("code_graph: protobuf index failed: %s", exc)
+        return None
+
+
 def _convert_to_sqlite(scip_paths: tuple[Path, ...], out_dir: Path) -> Path:
     if not _binary_exists("scip"):
         raise IndexerError("scip CLI missing from sandbox")
@@ -817,6 +844,7 @@ def build_index(target_dir: Path, out_dir: Path) -> IndexResult:
         ("java", _index_java),
         ("terraform", _index_terraform),
         ("kubernetes", _index_k8s),
+        ("protobuf", _index_protobuf),
     )
     indexers = _select_languages(indexers)
     for lang, index_fn in indexers:
@@ -853,7 +881,7 @@ def load_index(sqlite_path: Path) -> Path:
     return sqlite_path
 
 
-_PKG_SCHEMES = {"gomod", "npm", "python", "cargo", "maven", "nuget", "pypi", "semanticdb"}
+_PKG_SCHEMES = {"gomod", "npm", "python", "cargo", "maven", "nuget", "pypi", "semanticdb", "proto"}
 
 
 def _normalize_moniker_version(symbol: str | None, label: str) -> str | None:
