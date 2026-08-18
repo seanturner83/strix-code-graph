@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import scip_pb2
 from .cache import CacheKey, CodeGraphCache
 from .cache import from_env as _cache_from_env
 
@@ -740,6 +741,44 @@ def _index_protobuf(target: Path, out_dir: Path) -> Path | None:
         return None
 
 
+_ROLE_DEFINITION = 0x1
+
+
+def _patch_missing_symbol_information(scip_path: Path) -> int:
+    """Insert a minimal placeholder SymbolInformation for any symbol that has
+    a definition-role occurrence but no corresponding SymbolInformation entry
+    in its document. Returns the number of placeholders inserted (0 if the
+    file needed no patching -- re-serializing is skipped in that case).
+
+    Known scip-python bug (sourcegraph/scip-python#223, filed 2026-07-29,
+    open/unfixed as of scip-python 0.6.6): SymbolInformation is missing for
+    @dataclass class symbols themselves and for many stdlib symbols.
+    scip expt-convert's OWN validator (convert.go:395) hard-errors -- and
+    ABORTS THE ENTIRE CONVERSION, not just that one symbol -- on any such
+    symbol that has an enclosing range, so a single missing SymbolInformation
+    anywhere in a large repo makes the whole index unusable. This mirrors the
+    workaround the issue reporter describes: parse the .scip protobuf, find
+    symbols with occurrences but no SymbolInformation, insert minimal
+    placeholders, re-serialize before expt-convert runs.
+    """
+    idx = scip_pb2.Index()
+    idx.ParseFromString(scip_path.read_bytes())
+    patched = 0
+    for doc in idx.documents:
+        known = {si.symbol for si in doc.symbols}
+        needed = {
+            occ.symbol for occ in doc.occurrences
+            if occ.symbol_roles & _ROLE_DEFINITION and occ.symbol not in known
+        }
+        for sym in needed:
+            si = doc.symbols.add()
+            si.symbol = sym
+            patched += 1
+    if patched:
+        scip_path.write_bytes(idx.SerializeToString())
+    return patched
+
+
 def _convert_to_sqlite(scip_paths: tuple[Path, ...], out_dir: Path) -> Path:
     if not _binary_exists("scip"):
         raise IndexerError("scip CLI missing from sandbox")
@@ -752,7 +791,8 @@ def _convert_to_sqlite(scip_paths: tuple[Path, ...], out_dir: Path) -> Path:
     # the merge (straight passthrough).
     #
     # Per-language isolation: a candidate can fail conversion — notably
-    # scip-python emits synthetic `_ScratchFile#` symbols that expt-convert's
+    # scip-python emits synthetic `_ScratchFile#` symbols (among others,
+    # see _patch_missing_symbol_information above) that expt-convert's
     # validator rejects (observed on a real polyglot repo). One language's
     # failure must not lose the others, so we convert best-effort and merge
     # whatever succeeded.
@@ -764,6 +804,15 @@ def _convert_to_sqlite(scip_paths: tuple[Path, ...], out_dir: Path) -> Path:
         # bare relative paths.
         lang = candidate.stem
         per_lang = out_dir / f"{lang}.code_graph.sqlite"
+        try:
+            n = _patch_missing_symbol_information(candidate)
+            if n:
+                logger.info(
+                    "code_graph: patched %d missing SymbolInformation entr%s in %s "
+                    "(scip-python#223 workaround)", n, "y" if n == 1 else "ies", candidate.name,
+                )
+        except Exception as exc:  # noqa: BLE001 — patch is best-effort, never blocks conversion
+            logger.warning("code_graph: symbol-info patch failed on %s: %s", candidate.name, exc)
         try:
             _run(["scip", "expt-convert", str(candidate), "--output", str(per_lang)])
         except IndexerError as exc:
