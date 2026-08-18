@@ -130,10 +130,12 @@ RUN set -eux; \
     rm /tmp/kz.tar.gz; kustomize version
 
 # --- the addon package : into the base venv (in-sandbox code needs only proto) -
-# In-sandbox indexer/merge need protobuf + stdlib, NOT strix-agent (that's the
-# runner-side tool-registration dep). --no-deps + explicit protobuf.
+# In-sandbox indexer/merge need protobuf + pyyaml (scip_k8s parses
+# Chart.yaml/values.yaml directly) + stdlib, NOT strix-agent (that's the
+# runner-side tool-registration dep). --no-deps + explicit protobuf/pyyaml --
+# both are real strix-code-graph deps that --no-deps would otherwise skip.
 COPY --chown=pentester:pentester . /opt/strix-code-graph/src
-RUN /app/.venv/bin/pip install --no-cache-dir "protobuf>=5.0" \
+RUN /app/.venv/bin/pip install --no-cache-dir "protobuf>=5.0" "pyyaml>=6.0" \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps /opt/strix-code-graph/src \
     && /app/.venv/bin/python -c "import strix_code_graph.indexer, strix_code_graph.merge; print('strix-code-graph installed')"
 

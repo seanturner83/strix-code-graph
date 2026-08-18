@@ -13,6 +13,12 @@ dependencies = [
   "strix-agent>=1.1.0",
   # Vendored scip_pb2 modules need the protobuf runtime to parse SCIP indexes.
   "protobuf>=5.0",
+  # scip_k8s/indexer.py imports yaml directly to parse Chart.yaml/values.yaml.
+  # Previously undeclared -- only "worked" by riding along transitively via
+  # strix-agent's own dependency tree, which breaks for any install path
+  # that skips strix-agent (e.g. --no-deps + a separate protobuf/strix-agent
+  # install, used by standalone code-graph builds outside a full sandbox).
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
