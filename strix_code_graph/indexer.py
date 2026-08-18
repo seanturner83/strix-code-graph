@@ -419,21 +419,46 @@ def _index_python(target: Path, out_dir: Path) -> Path | None:
     return out if out.exists() else None
 
 
+def _cargo_home() -> Path:
+    """Root for the Rust toolchain install (parent of .cargo/.rustup).
+
+    Defaults to /home/pentester -- the sandbox image's user, matching this
+    function's original hardcoded behaviour exactly (so the baked sandbox
+    image's lazy-install path is completely unaffected). Override via
+    CARGO_HOME (Rust's own standard env var for this, not a strix-code-
+    graph invention) for hosts where that user doesn't exist -- e.g. a bare
+    CI runner building a corpus-wide index standalone, outside any Strix
+    sandbox session.
+    """
+    override = os.environ.get("CARGO_HOME", "").strip()
+    if override:
+        # CARGO_HOME conventionally points AT .cargo itself, not its parent
+        # -- if the caller set it to .../.cargo, use its parent as the
+        # toolchain root so RUSTUP_HOME lands as a .rustup sibling, not
+        # nested inside .cargo.
+        p = Path(override)
+        return p.parent if p.name == ".cargo" else p
+    return Path("/home/pentester")
+
+
 def _ensure_rust_toolchain() -> str | None:
     """Lazy-install rustup + rust-analyzer component on first use.
 
     Rust toolchain is ~500MB which we don't want to bake into the
     sandbox image — most scans don't touch Rust. Install on demand
-    into /home/pentester/.cargo + /home/pentester/.rustup; cached
-    across scans in the same sandbox lifetime.
+    into <_cargo_home()>/.cargo + .rustup; cached across scans in the
+    same sandbox lifetime (or, for a standalone CARGO_HOME override,
+    across runs of whatever process set it).
 
     Returns the bin dir containing rust-analyzer + cargo + rustc, or
     None if install fails (caller logs + degrades to no-index).
     """
-    cargo_bin = Path("/home/pentester/.cargo/bin")
+    home = _cargo_home()
+    cargo_bin = home / ".cargo" / "bin"
     if (cargo_bin / "rust-analyzer").exists():
         return str(cargo_bin)
-    logger.info("code_graph: lazy-installing rust toolchain for first Rust target")
+    logger.info("code_graph: lazy-installing rust toolchain for first Rust target (root=%s)", home)
+    install_env = {"CARGO_HOME": str(home / ".cargo"), "RUSTUP_HOME": str(home / ".rustup")}
     try:
         # rustup-init script: minimal profile (no docs/clippy/rustfmt),
         # stable channel, then add rust-analyzer component explicitly.
@@ -446,14 +471,12 @@ def _ensure_rust_toolchain() -> str | None:
                 "--no-modify-path",
             ],
             timeout=600,
+            env=install_env,
         )
         _run(
-            [
-                "sh",
-                "-c",
-                "/home/pentester/.cargo/bin/rustup component add rust-analyzer",
-            ],
+            [str(cargo_bin / "rustup"), "component", "add", "rust-analyzer"],
             timeout=300,
+            env=install_env,
         )
     except IndexerError as exc:
         logger.warning("code_graph: rust toolchain lazy-install failed (%s)", exc)
