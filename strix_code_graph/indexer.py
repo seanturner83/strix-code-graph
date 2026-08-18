@@ -332,7 +332,16 @@ def _index_typescript(target: Path, out_dir: Path) -> Path | None:
                     exc2,
                 )
     out = out_dir / "ts.scip"
-    _run(["scip-typescript", "index", "--output", str(out)], cwd=target)
+    # --infer-tsconfig: scip-typescript's own built-in synthesis for repos
+    # with real TS/JS source but no tsconfig.json anywhere (confirmed
+    # live: 14 corpus repos hit this, e.g. Hardhat/JS-test-only repos with
+    # no TypeScript project file at all). Verified a no-op, byte-identical
+    # output, when a real tsconfig.json already exists -- safe to pass
+    # unconditionally rather than branching on whether one was found.
+    # Repos with genuinely zero source (e.g. a config-only npm package)
+    # still degrade cleanly: scip-typescript exits 0 with "no files got
+    # indexed", so `out.exists()` is False below, same as today.
+    _run(["scip-typescript", "index", "--infer-tsconfig", "--output", str(out)], cwd=target)
     return out if out.exists() else None
 
 
