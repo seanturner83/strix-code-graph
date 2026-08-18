@@ -29,6 +29,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -441,6 +442,17 @@ def _cargo_home() -> Path:
     return Path("/home/pentester")
 
 
+# Guards the check-then-install below against concurrent callers -- a
+# multi-repo indexing job (e.g. a standalone corpus-wide build) can run
+# several Rust targets' indexing in parallel worker threads, and this
+# function was originally written for strix-code-graph's own in-sandbox
+# loop, which indexes targets strictly sequentially (no concurrency ever
+# existed here before). A plain module-level threading.Lock is sufficient
+# scope: every concurrent caller in this class of use is a thread in the
+# SAME process, never a separate process.
+_RUST_TOOLCHAIN_LOCK = threading.Lock()
+
+
 def _ensure_rust_toolchain() -> str | None:
     """Lazy-install rustup + rust-analyzer component on first use.
 
@@ -457,38 +469,45 @@ def _ensure_rust_toolchain() -> str | None:
     cargo_bin = home / ".cargo" / "bin"
     if (cargo_bin / "rust-analyzer").exists():
         return str(cargo_bin)
-    logger.info("code_graph: lazy-installing rust toolchain for first Rust target (root=%s)", home)
-    install_env = {"CARGO_HOME": str(home / ".cargo"), "RUSTUP_HOME": str(home / ".rustup")}
-    try:
-        # rustup-init script: minimal profile (no docs/clippy/rustfmt),
-        # stable channel, then add rust-analyzer component explicitly.
-        _run(
-            [
-                "sh",
-                "-c",
-                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
-                "| sh -s -- -y --default-toolchain stable --profile minimal "
-                "--no-modify-path",
-            ],
-            timeout=600,
-            env=install_env,
+    with _RUST_TOOLCHAIN_LOCK:
+        # Re-check: another thread may have finished installing while this
+        # one was waiting for the lock.
+        if (cargo_bin / "rust-analyzer").exists():
+            return str(cargo_bin)
+        logger.info(
+            "code_graph: lazy-installing rust toolchain for first Rust target (root=%s)", home,
         )
-        _run(
-            [str(cargo_bin / "rustup"), "component", "add", "rust-analyzer"],
-            timeout=300,
-            env=install_env,
-        )
-    except IndexerError as exc:
-        logger.warning("code_graph: rust toolchain lazy-install failed (%s)", exc)
-        return None
-    if not (cargo_bin / "rust-analyzer").exists():
-        logger.warning(
-            "code_graph: rustup install reported success but rust-analyzer "
-            "not at %s; check toolchain",
-            cargo_bin,
-        )
-        return None
-    return str(cargo_bin)
+        install_env = {"CARGO_HOME": str(home / ".cargo"), "RUSTUP_HOME": str(home / ".rustup")}
+        try:
+            # rustup-init script: minimal profile (no docs/clippy/rustfmt),
+            # stable channel, then add rust-analyzer component explicitly.
+            _run(
+                [
+                    "sh",
+                    "-c",
+                    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
+                    "| sh -s -- -y --default-toolchain stable --profile minimal "
+                    "--no-modify-path",
+                ],
+                timeout=600,
+                env=install_env,
+            )
+            _run(
+                [str(cargo_bin / "rustup"), "component", "add", "rust-analyzer"],
+                timeout=300,
+                env=install_env,
+            )
+        except IndexerError as exc:
+            logger.warning("code_graph: rust toolchain lazy-install failed (%s)", exc)
+            return None
+        if not (cargo_bin / "rust-analyzer").exists():
+            logger.warning(
+                "code_graph: rustup install reported success but rust-analyzer "
+                "not at %s; check toolchain",
+                cargo_bin,
+            )
+            return None
+        return str(cargo_bin)
 
 
 def _index_rust(target: Path, out_dir: Path) -> Path | None:

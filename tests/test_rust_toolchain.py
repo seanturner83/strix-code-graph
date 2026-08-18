@@ -9,6 +9,8 @@ unaffected.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -144,3 +146,45 @@ def test_index_rust_passes_matching_cargo_and_rustup_home_to_cargo_fetch_and_sci
             "CARGO_HOME": str(tmp_path / ".cargo"),
             "RUSTUP_HOME": str(tmp_path / ".rustup"),
         }
+
+
+def test_ensure_rust_toolchain_installs_only_once_under_concurrent_callers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A standalone multi-repo indexing job (this addon's own primary
+    concurrent consumer today) runs several Rust targets' indexing in
+    parallel worker threads -- this function was originally written for
+    strix-code-graph's own in-sandbox loop, which indexes strictly
+    sequentially, so the check-then-install here was never exercised
+    concurrently before. Without a lock, N threads can all observe
+    "not installed yet" and all launch rustup-init into the same
+    CARGO_HOME/RUSTUP_HOME at once."""
+    monkeypatch.setenv("CARGO_HOME", str(tmp_path / ".cargo"))
+    cargo_bin = tmp_path / ".cargo" / "bin"
+    install_calls = []
+    lock = threading.Lock()
+
+    def _fake_run(cmd, cwd=None, timeout=600, env=None, base_env=None):
+        with lock:
+            install_calls.append(cmd)
+        # Simulate a slow install so concurrent callers actually overlap.
+        time.sleep(0.05)
+        cargo_bin.mkdir(parents=True, exist_ok=True)
+        (cargo_bin / "rust-analyzer").write_text("#!/bin/sh\n")
+
+    monkeypatch.setattr(indexer, "_run", _fake_run)
+
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(indexer._ensure_rust_toolchain()))
+        for _ in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == [str(cargo_bin)] * 8
+    # Exactly one install attempt (2 _run calls: rustup-init + component add)
+    # -- not one PER concurrent caller.
+    assert len(install_calls) == 2, f"expected exactly 1 install (2 calls), got {install_calls}"
