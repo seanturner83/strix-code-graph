@@ -788,6 +788,44 @@ def _patch_missing_symbol_information(scip_path: Path) -> int:
     return patched
 
 
+def _patch_invalid_enclosing_ranges(scip_path: Path) -> int:
+    """Clear any occurrence's enclosing_range where the end position is
+    before the start. Returns the number cleared (0 if the file needed no
+    patching -- re-serializing is skipped in that case).
+
+    Known scip-go bug: its enclosing_range support (scip-code/scip-go#172,
+    merged 2025-11-24) computed a zero-valued end position for at least one
+    real function (observed live: 1 malformed range out of 152 enclosing
+    ranges in a real repo). scip expt-convert's own validator hard-errors
+    -- and ABORTS THE ENTIRE CONVERSION, not just that one occurrence -- on
+    "bad enclosing range ... end before start". enclosing_range is
+    best-effort smart-selection metadata, not required for symbol
+    resolution (most occurrences have none at all), so clearing a
+    malformed one is a safe degrade, mirroring
+    _patch_missing_symbol_information's approach for a different
+    expt-convert validator failure.
+    """
+    idx = scip_pb2.Index()
+    idx.ParseFromString(scip_path.read_bytes())
+    patched = 0
+    for doc in idx.documents:
+        for occ in doc.occurrences:
+            er = occ.enclosing_range
+            if len(er) == 4:
+                sl, sc, el, ec = er
+            elif len(er) == 3:
+                sl, sc, ec = er
+                el = sl
+            else:
+                continue
+            if (el, ec) < (sl, sc):
+                del occ.enclosing_range[:]
+                patched += 1
+    if patched:
+        scip_path.write_bytes(idx.SerializeToString())
+    return patched
+
+
 def _convert_to_sqlite(scip_paths: tuple[Path, ...], out_dir: Path) -> Path:
     if not _binary_exists("scip"):
         raise IndexerError("scip CLI missing from sandbox")
@@ -822,6 +860,17 @@ def _convert_to_sqlite(scip_paths: tuple[Path, ...], out_dir: Path) -> Path:
                 )
         except Exception as exc:  # noqa: BLE001 — patch is best-effort, never blocks conversion
             logger.warning("code_graph: symbol-info patch failed on %s: %s", candidate.name, exc)
+        try:
+            n = _patch_invalid_enclosing_ranges(candidate)
+            if n:
+                logger.info(
+                    "code_graph: cleared %d invalid enclosing_range entr%s in %s "
+                    "(scip-go#172 workaround)", n, "y" if n == 1 else "ies", candidate.name,
+                )
+        except Exception as exc:  # noqa: BLE001 — patch is best-effort, never blocks conversion
+            logger.warning(
+                "code_graph: enclosing-range patch failed on %s: %s", candidate.name, exc,
+            )
         try:
             _run(["scip", "expt-convert", str(candidate), "--output", str(per_lang)])
         except IndexerError as exc:
