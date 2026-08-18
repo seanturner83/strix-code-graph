@@ -24,6 +24,7 @@ import argparse
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import sqlite3
@@ -146,6 +147,23 @@ def _run(
         )
 
 
+def _node_arch() -> str:
+    """Map the current machine's architecture to nodejs.org's own tarball
+    naming (node-v<ver>-linux-<arch>.tar.xz). platform.machine() on Linux
+    returns "x86_64"/"aarch64"/etc — nodejs.org uses "x64"/"arm64". Without
+    this, a hardcoded "x64" tarball fetched on an arm64 runner is an
+    incompatible-architecture ELF binary: the shell can't exec it and,
+    depending on the shell, falls back to interpreting its binary content
+    AS a script, producing a confusing "Syntax error: ')' unexpected" with
+    no indication the real problem is architecture mismatch -- live-
+    observed on an arm64 ARC runner (funding-service/trade-repository-
+    service both pin engines.node, both hit this every time). Defaults to
+    "x64" for any machine string not explicitly mapped, matching this
+    function's original (and still correct for x86_64 sandboxes) hardcoded
+    behavior."""
+    return {"aarch64": "arm64", "arm64": "arm64"}.get(platform.machine(), "x64")
+
+
 def _ensure_node_version(target: Path) -> str | None:
     """Resolve the Node version pinned by package.json's `engines.node` and
     install it into /tmp on demand if the sandbox's default node doesn't
@@ -196,12 +214,13 @@ def _ensure_node_version(target: Path) -> str | None:
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
 
-    node_dir = Path(f"/tmp/node-v{desired}-linux-x64")
+    arch = _node_arch()
+    node_dir = Path(f"/tmp/node-v{desired}-linux-{arch}")
     if node_dir.exists() and (node_dir / "bin" / "node").exists():
         logger.info("code_graph: using cached node v%s at %s", desired, node_dir)
         return str(node_dir / "bin")
 
-    url = f"https://nodejs.org/dist/v{desired}/node-v{desired}-linux-x64.tar.xz"
+    url = f"https://nodejs.org/dist/v{desired}/node-v{desired}-linux-{arch}.tar.xz"
     logger.info("code_graph: fetching node v%s from nodejs.org", desired)
     try:
         _run(
