@@ -12,7 +12,7 @@ from strix_code_graph.query import CodeGraphIndex
 _SCHEMA = """
 CREATE TABLE documents(id INTEGER PRIMARY KEY, language TEXT, relative_path TEXT,
                        position_encoding INTEGER, text TEXT);
-CREATE TABLE global_symbols(id INTEGER PRIMARY KEY, symbol TEXT, display_name TEXT,
+CREATE TABLE global_symbols(id INTEGER PRIMARY KEY, symbol TEXT UNIQUE, display_name TEXT,
                             kind INTEGER, documentation TEXT, relationships BLOB);
 CREATE TABLE chunks(id INTEGER PRIMARY KEY, document_id INTEGER, chunk_index INTEGER,
                     start_line INTEGER, end_line INTEGER, occurrences BLOB);
@@ -277,6 +277,25 @@ def test_normalize_moniker_qualifies_local_monikers_by_source_label() -> None:
     )
     pkg = "scip-go gomod github.com/org/x v1.0.0 `github.com/org/x/pkg`/Foo()."
     assert _normalize_moniker_version(pkg, "repo-a") == _normalize_moniker_version(pkg, "repo-b")
+
+
+def test_storable_symbol_qualifies_locals_but_not_packages() -> None:
+    """global_symbols.symbol is UNIQUE in the real scip-CLI-generated schema
+    -- independent of the dedup KEY (_normalize_moniker_version). Two
+    unrelated locals sharing an identical literal moniker get different
+    dedup keys (correctly) but, without this, would still try to store the
+    identical text -- a real UNIQUE(symbol) violation live-observed merging
+    738 real repos. Package monikers must NOT be qualified -- doing so
+    would defeat their whole point (a second source's identical literal
+    text needs to be excluded by the dedup filter before it ever reaches
+    this function, not stored under a different key)."""
+    from strix_code_graph.indexer import _storable_symbol
+
+    assert _storable_symbol("local 0", "repo-a") == "repo-a/local 0"
+    assert _storable_symbol("local 0", "repo-b") == "repo-b/local 0"
+    pkg = "scip-go gomod github.com/org/x v1.0.0 `github.com/org/x/pkg`/Foo()."
+    assert _storable_symbol(pkg, "repo-a") == pkg
+    assert _storable_symbol(pkg, "repo-b") == pkg
 
 
 def test_merge_keeps_unrelated_local_symbols_from_different_repos_apart(

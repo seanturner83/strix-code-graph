@@ -550,8 +550,29 @@ def _index_rust(target: Path, out_dir: Path) -> Path | None:
     # 'rust-analyzer' in official toolchain ...". Pass both explicitly,
     # layered on top of scrubbed via _run's env= (never a security concern:
     # these are directory paths, not secrets).
+    #
+    # RUSTUP_TOOLCHAIN=stable: _ensure_rust_toolchain only installs
+    # rust-analyzer for the "stable" channel. rustup's own proxy dispatch
+    # resolves the ACTIVE toolchain per-invocation, and both `cargo` and
+    # `rust-analyzer` run with cwd=target -- if the target repo ships its
+    # own rust-toolchain.toml/rust-toolchain pinning a different channel
+    # (routine: MSRV pins, live-observed at real scale across a 738-repo
+    # corpus with channels like "1.91", "1.90.0", "1.95.0"), rustup's own
+    # directory-override precedence silently switches to THAT toolchain
+    # instead, which never had rust-analyzer installed -- same "Unknown
+    # binary" error, different root cause than the CARGO_HOME/RUSTUP_HOME
+    # one above. RUSTUP_TOOLCHAIN is documented to outrank a directory's
+    # toolchain file, forcing our one lazily-installed toolchain regardless
+    # of what any given target pins. This index is a best-effort corpus-wide
+    # graph, not a real build -- exact per-repo toolchain fidelity isn't the
+    # goal, and installing a distinct toolchain per repo's own pin would be
+    # unbounded (dozens of repos, dozens of ~500MB installs).
     home = _cargo_home()
-    toolchain_env = {"CARGO_HOME": str(home / ".cargo"), "RUSTUP_HOME": str(home / ".rustup")}
+    toolchain_env = {
+        "CARGO_HOME": str(home / ".cargo"),
+        "RUSTUP_HOME": str(home / ".rustup"),
+        "RUSTUP_TOOLCHAIN": "stable",
+    }
 
     # Pre-fetch the crate graph. rust-analyzer's metadata pass would
     # otherwise stall on network; pulling crates explicitly with a
@@ -896,6 +917,39 @@ def _normalize_moniker_version(symbol: str | None, label: str) -> str | None:
     return f"{label}\x00{symbol}"
 
 
+def _storable_symbol(symbol: str | None, label: str) -> str | None:
+    """The literal text persisted in ``global_symbols.symbol`` -- which the
+    real scip-CLI-generated schema enforces as UNIQUE, independent of the
+    dedup KEY above (see ``_normalize_moniker_version``'s docstring).
+
+    A package moniker's raw literal text is always safe to store as-is: two
+    sources with the identical literal text share the same dedup key too
+    (so the second is already excluded before insertion ever happens), and
+    two sources with a genuinely different literal package moniker for the
+    same symbol (different pinned versions) never collide on raw text
+    either.
+
+    A local moniker's raw literal text is NOT safe to store as-is: SCIP's
+    own "local N" numbering is only unique within its own source, so two
+    UNRELATED locals sharing an identical literal string (e.g. both
+    literally ``local 0``) get DIFFERENT dedup keys (correctly, per
+    ``_normalize_moniker_version``) but would otherwise both try to store
+    the SAME ``symbol`` text -- violating ``global_symbols``' own
+    UNIQUE(symbol) even though they're intentionally kept as separate rows.
+    Live-observed merging 738 real repos. Qualify by label using the same
+    ``<label>/<rest>`` convention already used for ``documents.
+    relative_path`` -- this also keeps ``query.py``'s
+    ``_extract_display_name`` parsing correct (it reads the text after the
+    LAST ``/``, so a ``/``-prefixed local moniker still displays cleanly).
+    """
+    if not symbol:
+        return symbol
+    parts = symbol.split(" ")
+    if len(parts) >= 5 and parts[1] in _PKG_SCHEMES:
+        return symbol
+    return f"{label}/{symbol}"
+
+
 def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
     """Merge several per-target code-graph SQLite DBs into ONE, so a
     multi-target scan queries a single unified graph.
@@ -938,6 +992,7 @@ def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
     # (a symbol added/removed between releases) they merge anyway; for a
     # reachability/chaining graph an over-connected edge beats a missing one.
     conn.create_function("norm_moniker", 2, _normalize_moniker_version, deterministic=True)
+    conn.create_function("storable_symbol", 2, _storable_symbol, deterministic=True)
     try:
         # Materialise the schema from the first source, then append every
         # source's rows with id offsets + path prefixes.
@@ -978,6 +1033,12 @@ def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
         gs_cols = [r[1] for r in conn.execute("PRAGMA table_info(global_symbols)").fetchall()]
         gs_non_id = [c for c in gs_cols if c != "id"]
         gs_col_list = ", ".join(gs_non_id)
+        # `symbol` needs its OWN qualified select-expression (storable_symbol,
+        # see its docstring); every other column passes through verbatim.
+        gs_select_list = ", ".join(
+            "storable_symbol(symbol, ?) AS symbol" if c == "symbol" else c
+            for c in gs_non_id
+        )
 
         # PERF: the version-agnostic dedup key (norm_moniker) is a Python UDF, so
         # calling it inside a `NOT IN (SELECT norm_moniker(...))` / a join
@@ -1005,9 +1066,9 @@ def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
             conn.execute("DROP TABLE IF EXISTS _src_syms")
             conn.execute(
                 f"CREATE TEMP TABLE _src_syms AS "
-                f"SELECT id AS src_id, norm_moniker(symbol, ?) AS nkey, {gs_col_list} "
+                f"SELECT id AS src_id, norm_moniker(symbol, ?) AS nkey, {gs_select_list} "
                 f"FROM src.global_symbols",
-                (label,),
+                (label, label),
             )
             conn.execute("CREATE INDEX ix_srcsyms_nkey ON _src_syms(nkey)")
             conn.execute("CREATE INDEX ix_srcsyms_id ON _src_syms(src_id)")

@@ -145,7 +145,47 @@ def test_index_rust_passes_matching_cargo_and_rustup_home_to_cargo_fetch_and_sci
         assert c["env"] == {
             "CARGO_HOME": str(tmp_path / ".cargo"),
             "RUSTUP_HOME": str(tmp_path / ".rustup"),
+            "RUSTUP_TOOLCHAIN": "stable",
         }
+
+
+def test_index_rust_forces_stable_toolchain_despite_a_target_pinned_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression, distinct from the CARGO_HOME/RUSTUP_HOME one above:
+    cargo/rust-analyzer run with cwd=target, and rustup's own directory-
+    override precedence auto-switches to whatever toolchain a target's OWN
+    rust-toolchain.toml/rust-toolchain pins -- routine (MSRV pins),
+    live-observed across a 738-repo corpus with channels like "1.91",
+    "1.90.0", "1.95.0". _ensure_rust_toolchain only ever installs
+    rust-analyzer for "stable", so a pinned-toolchain target would silently
+    resolve to a toolchain that never had it added -- "Unknown binary
+    'rust-analyzer' in official toolchain '1.91-...'". RUSTUP_TOOLCHAIN
+    outranks a directory's toolchain file per rustup's own precedence
+    rules, forcing the one toolchain this addon actually installed."""
+    monkeypatch.setenv("CARGO_HOME", str(tmp_path / ".cargo"))
+    cargo_bin = tmp_path / ".cargo" / "bin"
+    cargo_bin.mkdir(parents=True)
+    (cargo_bin / "rust-analyzer").write_text("#!/bin/sh\n")
+
+    target = tmp_path / "pinned-crate"
+    target.mkdir()
+    (target / "Cargo.toml").write_text("[package]\nname = \"foo\"\n")
+    (target / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.91"\n')
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    calls = []
+
+    def _fake_run(cmd, cwd=None, timeout=600, env=None, base_env=None):
+        calls.append(env)
+        if str(cmd[0]).endswith("rust-analyzer"):
+            (out_dir / "rs.scip").write_bytes(b"fake scip")
+
+    monkeypatch.setattr(indexer, "_run", _fake_run)
+    indexer._index_rust(target, out_dir)
+
+    assert calls and all(env["RUSTUP_TOOLCHAIN"] == "stable" for env in calls)
 
 
 def test_ensure_rust_toolchain_installs_only_once_under_concurrent_callers(
