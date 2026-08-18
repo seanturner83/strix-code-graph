@@ -16,7 +16,8 @@ CREATE TABLE global_symbols(id INTEGER PRIMARY KEY, symbol TEXT, display_name TE
                             kind INTEGER, documentation TEXT, relationships BLOB);
 CREATE TABLE chunks(id INTEGER PRIMARY KEY, document_id INTEGER, chunk_index INTEGER,
                     start_line INTEGER, end_line INTEGER, occurrences BLOB);
-CREATE TABLE mentions(chunk_id INTEGER, symbol_id INTEGER, role INTEGER);
+CREATE TABLE mentions(chunk_id INTEGER, symbol_id INTEGER, role INTEGER,
+                      UNIQUE(chunk_id, symbol_id, role));
 CREATE TABLE defn_enclosing_ranges(symbol_id INTEGER, document_id INTEGER,
                                    start_line INTEGER, start_char INTEGER,
                                    end_line INTEGER, end_char INTEGER);
@@ -256,6 +257,124 @@ def test_merge_keeps_distinct_descriptors_apart(tmp_path: Path) -> None:
     n = conn.execute("SELECT count(*) FROM global_symbols").fetchone()[0]
     conn.close()
     assert n == 2, f"distinct-descriptor same-name types must stay separate, got {n}"
+
+
+def test_normalize_moniker_qualifies_local_monikers_by_source_label() -> None:
+    """SCIP's own "local N" numbering restarts per document/index -- it is
+    unique only WITHIN its own originating index, never globally. Two
+    entirely unrelated locally-scoped symbols in different targets routinely
+    share the identical literal moniker (both emit ``local 0``). The dedup
+    key must NOT treat these as the same symbol, unlike a real package
+    moniker (still label-agnostic -- that's the cross-repo edge this
+    function exists to create in the first place)."""
+    from strix_code_graph.indexer import _normalize_moniker_version
+
+    assert _normalize_moniker_version("local 0", "repo-a") != _normalize_moniker_version(
+        "local 0", "repo-b",
+    )
+    assert _normalize_moniker_version("local 0", "repo-a") == _normalize_moniker_version(
+        "local 0", "repo-a",
+    )
+    pkg = "scip-go gomod github.com/org/x v1.0.0 `github.com/org/x/pkg`/Foo()."
+    assert _normalize_moniker_version(pkg, "repo-a") == _normalize_moniker_version(pkg, "repo-b")
+
+
+def test_merge_keeps_unrelated_local_symbols_from_different_repos_apart(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: two UNRELATED repos each define their own locally-scoped
+    symbol using SCIP's generic ``local 0`` moniker. Before qualifying local
+    monikers by source label, the merge's cross-repo dedup wrongly treated
+    the second repo's local 0 as "the same symbol" as the first's and
+    collapsed them -- silently wrong graph edges (a reference in repo B
+    would incorrectly resolve to repo A's unrelated local), not just a
+    missed merge."""
+    a = tmp_path / "a" / "code_graph.sqlite"
+    b = tmp_path / "b" / "code_graph.sqlite"
+    a.parent.mkdir()
+    b.parent.mkdir()
+    # Same literal (unqualified) moniker AND same display name in both --
+    # exactly the case that used to collapse.
+    _make_index(a, symbol="local 0", rel_path="internal/a.go")
+    _make_index(b, symbol="local 0", rel_path="internal/b.py")
+    dest = tmp_path / "out" / "code_graph.sqlite"
+
+    merge_sqlite_indexes([("repo-a", a), ("repo-b", b)], dest)
+
+    conn = sqlite3.connect(dest)
+    n_gs = conn.execute("SELECT count(*) FROM global_symbols").fetchone()[0]
+    conn.close()
+    assert n_gs == 2, f"unrelated locals sharing a generic moniker must stay apart, got {n_gs}"
+
+    idx = CodeGraphIndex(dest)
+    try:
+        # Each local's own definition resolves to ITS OWN file only.
+        defs = idx.find_definition("local")
+        files = {loc.file for _, loc in defs}
+        assert files == {"repo-a/internal/a.go", "repo-b/internal/b.py"}, files
+    finally:
+        idx.close()
+
+
+def test_merge_does_not_crash_when_a_source_has_two_symbols_sharing_a_dedup_key(
+    tmp_path: Path,
+) -> None:
+    """Live-observed merging 5 real repos: a single source can itself
+    contain two DISTINCT symbol_ids whose monikers normalize to the same
+    dedup key (e.g. two version variants of the same descriptor -- neither
+    is filtered against the OTHER within one source's own insert, so both
+    land in dest and the subsequent nkey-join fans a single mention out to
+    every matching dest row). If those two source symbols are each
+    mentioned with the same role in the same chunk, the fan-out can
+    reproduce the identical (chunk_id, symbol_id, role) triple twice, which
+    the real scip-CLI-generated schema enforces as UNIQUE. Must not raise.
+    """
+    a = tmp_path / "a" / "code_graph.sqlite"
+    a.parent.mkdir()
+    conn = sqlite3.connect(a)
+    conn.executescript(_SCHEMA)
+    conn.execute(
+        "INSERT INTO documents(id, language, relative_path, position_encoding, text) "
+        "VALUES (1, 'go', 'main.go', 0, '')",
+    )
+    # Same descriptor, different version tokens -- normalizes to one nkey.
+    sym_1 = "scip-go gomod github.com/org/x 4c2fdaa43a2e `github.com/org/x/pkg`/Foo()."
+    sym_2 = "scip-go gomod github.com/org/x v1.0.0 `github.com/org/x/pkg`/Foo()."
+    conn.execute(
+        "INSERT INTO global_symbols(id, symbol, display_name, kind, documentation, relationships) "
+        "VALUES (1, ?, 'Foo', 0, '', NULL)",
+        (sym_1,),
+    )
+    conn.execute(
+        "INSERT INTO global_symbols(id, symbol, display_name, kind, documentation, relationships) "
+        "VALUES (2, ?, 'Foo', 0, '', NULL)",
+        (sym_2,),
+    )
+    conn.execute(
+        "INSERT INTO chunks(id, document_id, chunk_index, start_line, end_line, occurrences) "
+        "VALUES (1, 1, 0, 10, 12, NULL)",
+    )
+    conn.execute("INSERT INTO mentions(chunk_id, symbol_id, role) VALUES (1, 1, 8)")
+    conn.execute("INSERT INTO mentions(chunk_id, symbol_id, role) VALUES (1, 2, 8)")
+    conn.commit()
+    conn.close()
+
+    # A second, unrelated source -- multi-source is what exercises the
+    # dedup/remap path (a single source is a plain passthrough copy).
+    b = tmp_path / "b" / "code_graph.sqlite"
+    b.parent.mkdir()
+    _make_index(b, symbol="repo-b/bar.", rel_path="bar.py")
+
+    dest = tmp_path / "out" / "code_graph.sqlite"
+    merge_sqlite_indexes([("a", a), ("b", b)], dest)  # previously: sqlite3.IntegrityError
+
+    conn = sqlite3.connect(dest)
+    # No duplicate (chunk_id, symbol_id, role) triple survived -- if there
+    # were one, the table's own UNIQUE constraint would already have raised
+    # above; this just double-checks the row count is sane.
+    n_mentions = conn.execute("SELECT count(*) FROM mentions").fetchone()[0]
+    conn.close()
+    assert n_mentions > 0
 
 
 def test_merge_cli_argv(tmp_path: Path) -> None:

@@ -816,7 +816,7 @@ def load_index(sqlite_path: Path) -> Path:
 _PKG_SCHEMES = {"gomod", "npm", "python", "cargo", "maven", "nuget", "pypi", "semanticdb"}
 
 
-def _normalize_moniker_version(symbol: str | None) -> str | None:
+def _normalize_moniker_version(symbol: str | None, label: str) -> str | None:
     """Normalize a package-manager SCIP moniker to its DESCRIPTOR so the same
     symbol unifies across repos regardless of dependency version OR how the
     indexer attributed the owning module.
@@ -850,8 +850,20 @@ def _normalize_moniker_version(symbol: str | None) -> str | None:
     into the shared proto one, because its descriptor path differs. The stored
     ``symbol`` value is untouched; this is only the DEDUP KEY.
 
-    Left untouched: non-package monikers (``local <id>`` etc.) and malformed /
-    short monikers — returned verbatim.
+    Non-package monikers (``local <id>`` etc.) and malformed/short monikers are
+    qualified by ``label`` (the source target) rather than returned verbatim.
+    SCIP's own "local N" numbering restarts per document/index — it is only
+    unique WITHIN its own originating index, never globally — so two entirely
+    unrelated locally-scoped symbols from different targets (or different
+    per-language legs of the same target) routinely produce the identical
+    literal moniker (e.g. both emit ``local 0``). Returning it verbatim would
+    make the merge's cross-source dedup treat them as "the same symbol" and
+    collapse them into one canonical node — silently wrong graph edges, not
+    just a missed merge, and (observed live merging 5 real repos of five
+    different languages) can also produce a genuine duplicate `mentions` row
+    once two such wrongly-unified locals are each mentioned with the same
+    role. Package monikers deliberately stay label-agnostic — that's the
+    cross-repo edge this function exists to create.
     """
     if not symbol:
         return symbol
@@ -862,7 +874,7 @@ def _normalize_moniker_version(symbol: str | None) -> str | None:
         parts[2] = "*"  # package-name: blank (indexer mis-attribution)
         parts[3] = "*"  # version: blank (pin drift / commit-hash pseudo-version)
         return " ".join(parts)
-    return symbol
+    return f"{label}\x00{symbol}"
 
 
 def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
@@ -906,7 +918,7 @@ def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
     # the edge we want. Tradeoff: if two pinned versions genuinely diverged
     # (a symbol added/removed between releases) they merge anyway; for a
     # reachability/chaining graph an over-connected edge beats a missing one.
-    conn.create_function("norm_moniker", 1, _normalize_moniker_version, deterministic=True)
+    conn.create_function("norm_moniker", 2, _normalize_moniker_version, deterministic=True)
     try:
         # Materialise the schema from the first source, then append every
         # source's rows with id offsets + path prefixes.
@@ -974,8 +986,9 @@ def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
             conn.execute("DROP TABLE IF EXISTS _src_syms")
             conn.execute(
                 f"CREATE TEMP TABLE _src_syms AS "
-                f"SELECT id AS src_id, norm_moniker(symbol) AS nkey, {gs_col_list} "
+                f"SELECT id AS src_id, norm_moniker(symbol, ?) AS nkey, {gs_col_list} "
                 f"FROM src.global_symbols",
+                (label,),
             )
             conn.execute("CREATE INDEX ix_srcsyms_nkey ON _src_syms(nkey)")
             conn.execute("CREATE INDEX ix_srcsyms_id ON _src_syms(src_id)")
@@ -1007,8 +1020,19 @@ def merge_sqlite_indexes(sources: list[tuple[str, Path]], dest: Path) -> Path:
                 "FROM src.chunks",
                 (chunk_off, doc_off),
             )
+            # OR IGNORE: the version-agnostic dedup above is many-to-one by
+            # design (_sym_map can send two DISTINCT source symbol_ids to the
+            # same dest_id — e.g. two locally-scoped symbols whose monikers
+            # happen to normalize identically). If both of those source
+            # symbols are mentioned with the same role in the same chunk, the
+            # remapped rows are now IDENTICAL triples -- a real UNIQUE
+            # constraint violation observed live merging 5 real repos ("even
+            # deeper issue" beyond the CARGO_HOME/RUSTUP_HOME fixes). The
+            # fact asserted ("this chunk mentions this canonical symbol with
+            # this role") is unchanged by the duplicate; there's nothing to
+            # lose by keeping just one row.
             conn.execute(
-                "INSERT INTO mentions(chunk_id, symbol_id, role) "
+                "INSERT OR IGNORE INTO mentions(chunk_id, symbol_id, role) "
                 "SELECT m.chunk_id + ?, mp.dest_id, m.role "
                 "FROM src.mentions m JOIN _sym_map mp ON m.symbol_id = mp.src_id",
                 (chunk_off,),
