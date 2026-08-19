@@ -23,7 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-logger = logging.getLogger(__name__)
+# See bootstrap.py's comment: renamed to a "strix."-prefixed child so
+# Strix's own logging setup actually attaches a handler to it.
+logger = logging.getLogger(__name__.replace("strix_code_graph", "strix.code_graph", 1))
 
 
 @dataclass(frozen=True)

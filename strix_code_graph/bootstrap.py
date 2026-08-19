@@ -35,7 +35,20 @@ from typing import Any
 
 from . import tools
 
-logger = logging.getLogger(__name__)
+# Strix's own logging setup (strix/telemetry/logging.py setup_scan_logging)
+# only attaches its file/stream handlers to loggers named "strix" or
+# "openai.agents" (and their children) -- a third-party logger name like the
+# bare module __name__ ("strix_code_graph.bootstrap") is a SEPARATE
+# top-level namespace, never reached. Live-observed: every logger.info/
+# warning call in this addon was silently swallowed during a real Strix
+# scan (nothing in strix.log, nothing on stdout) -- Python's logging
+# "handler of last resort" only surfaces WARNING+ to stderr when no
+# handler is attached anywhere in a logger's propagation chain, and INFO
+# never reaches even that. Renaming to a "strix."-prefixed child makes it
+# propagate INTO Strix's own "strix" logger (which has the real handlers),
+# without this addon needing to configure any handler itself. Every module
+# in this package does the same __name__ -> "strix." + __name__ mapping.
+logger = logging.getLogger(__name__.replace("strix_code_graph", "strix.code_graph", 1))
 
 # Where the sandbox-built SQLite index is copied out to on the runner. The
 # query tools read this via query.CodeGraphIndex.discover().

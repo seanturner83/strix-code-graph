@@ -44,7 +44,9 @@ from google.protobuf import descriptor_pb2
 
 from .emit import Document, Occurrence, build_index, make_symbol, write_index
 
-logger = logging.getLogger(__name__)
+# See bootstrap.py's comment: renamed to a "strix."-prefixed child so
+# Strix's own logging setup actually attaches a handler to it.
+logger = logging.getLogger(__name__.replace("strix_code_graph", "strix.code_graph", 1))
 
 _BUILD_TIMEOUT_S = 120
 _TYPE_MESSAGE = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
