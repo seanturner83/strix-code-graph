@@ -108,3 +108,79 @@ def test_never_raises_on_a_corrupt_corpus_file(
 
     bootstrap._maybe_merge_corpus_graph(session_sqlite)  # must not raise
     assert session_sqlite.read_bytes() == before
+
+
+# -- _adopt_corpus_graph_wholesale --------------------------------------------
+
+
+def test_adopt_returns_false_when_no_corpus_path_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STRIX_CORPUS_GRAPH_PATH", raising=False)
+    assert bootstrap._adopt_corpus_graph_wholesale() is False
+
+
+def test_adopt_returns_false_when_corpus_path_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STRIX_CORPUS_GRAPH_PATH", str(tmp_path / "does-not-exist.sqlite"))
+    assert bootstrap._adopt_corpus_graph_wholesale() is False
+
+
+def test_adopt_copies_corpus_graph_to_resolved_out_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus_sqlite = tmp_path / "corpus.sqlite"
+    _make_index(corpus_sqlite, symbol="scip-go gomod github.com/seedcx/other v1.0.0 `pkg`/Other#",
+                rel_path="other.go")
+    monkeypatch.setenv("STRIX_CORPUS_GRAPH_PATH", str(corpus_sqlite))
+
+    out_dir = tmp_path / "persist"
+    monkeypatch.setenv("STRIX_CODE_GRAPH_PERSIST_DIR", str(out_dir))
+    monkeypatch.delenv("STRIX_CODE_GRAPH_DIR", raising=False)
+
+    assert bootstrap._adopt_corpus_graph_wholesale() is True
+    final_sqlite = out_dir / "target" / "code_graph.sqlite"
+    assert final_sqlite.read_bytes() == corpus_sqlite.read_bytes()
+
+
+def test_adopt_falls_back_to_false_on_copy_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus_sqlite = tmp_path / "corpus.sqlite"
+    _make_index(corpus_sqlite, symbol="scip-go gomod github.com/seedcx/other v1.0.0 `pkg`/Other#",
+                rel_path="other.go")
+    monkeypatch.setenv("STRIX_CORPUS_GRAPH_PATH", str(corpus_sqlite))
+
+    def _boom(*a: object, **kw: object) -> None:
+        raise OSError("disk full")
+    monkeypatch.setattr(bootstrap.shutil, "copyfile", _boom)
+
+    assert bootstrap._adopt_corpus_graph_wholesale() is False  # must not raise
+
+
+# -- _build_and_copy_out short-circuit -----------------------------------------
+
+
+async def test_build_and_copy_out_skips_sandbox_entirely_when_corpus_graph_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus_sqlite = tmp_path / "corpus.sqlite"
+    _make_index(corpus_sqlite, symbol="scip-go gomod github.com/seedcx/other v1.0.0 `pkg`/Other#",
+                rel_path="other.go")
+    monkeypatch.setenv("STRIX_CORPUS_GRAPH_PATH", str(corpus_sqlite))
+    out_dir = tmp_path / "persist"
+    monkeypatch.setenv("STRIX_CODE_GRAPH_PERSIST_DIR", str(out_dir))
+    monkeypatch.delenv("STRIX_CODE_GRAPH_DIR", raising=False)
+
+    class _BoomSession:
+        async def exec(self, *a: object, **kw: object) -> None:
+            raise AssertionError("must not touch the sandbox when adopting the corpus graph")
+
+        async def read(self, *a: object, **kw: object) -> None:
+            raise AssertionError("must not touch the sandbox when adopting the corpus graph")
+
+    await bootstrap._build_and_copy_out(_BoomSession(), ["repo-a", "repo-b"])
+
+    final_sqlite = out_dir / "target" / "code_graph.sqlite"
+    assert final_sqlite.read_bytes() == corpus_sqlite.read_bytes()

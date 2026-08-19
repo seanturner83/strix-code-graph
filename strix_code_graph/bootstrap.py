@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -160,11 +161,88 @@ def _target_subdirs(scan_config: dict[str, Any] | None) -> list[str]:
     return subdirs or [""]  # fall back to bare /workspace
 
 
+def _resolve_out_dir() -> Path:
+    """The runner-local dir the query tools read from. Resolves from the
+    first env name a consumer set (STRIX_CODE_GRAPH_PERSIST_DIR — the
+    pipeline's contract — then the _DIR alias), else a private tempdir.
+    Re-exports ALL names so the query tools (and any downstream) discover
+    the same dir regardless of which they read."""
+    configured = next((os.environ[n] for n in _ENV_DIRS if os.environ.get(n)), None)
+    out_dir = Path(configured or tempfile.mkdtemp(prefix="strix-code-graph-"))
+    for n in _ENV_DIRS:
+        os.environ[n] = str(out_dir)
+    return out_dir
+
+
+def _corpus_graph_path() -> Path | None:
+    """The pre-fetched, corpus-wide merged index the wrapping CI workflow
+    downloaded to a local path, if configured and present. See
+    _adopt_corpus_graph_wholesale's docstring for why this addon never
+    fetches it itself (stays AWS-free, same posture as cache.py)."""
+    corpus_path = os.environ.get("STRIX_CORPUS_GRAPH_PATH", "").strip()
+    if not corpus_path:
+        return None
+    p = Path(corpus_path)
+    return p if p.is_file() else None
+
+
+def _adopt_corpus_graph_wholesale() -> bool:
+    """If a pre-built, corpus-wide merged index is available, adopt it
+    DIRECTLY as this session's whole code graph instead of building one
+    from scratch inside the sandbox. Returns True if adopted (the caller
+    skips its own build entirely); False to fall through to the local
+    per-target build (no corpus graph configured, or adoption failed).
+
+    Why: a domain-scan's own local build loops over EVERY mounted target —
+    30+ domain/context repos PLUS the ~900-repo corpus-grep tree, which the
+    per-target indexer also treats as a scan target. Live-observed: this
+    consistently exceeds the 30-minute build timeout and degrades to
+    "unavailable" in EVERY domain-scan run observed (connect, connamara),
+    regardless of whether a corpus-wide graph was ALSO being merged in on
+    top of it — the local build itself never actually completes. The
+    corpus-wide graph (build_corpus_graph.py, refreshed on its own
+    schedule) already covers every one of those repos; rebuilding them
+    here, inside a live, credential-boundary-capped scan session, is
+    redundant work that was never completing anyway. A plain local file
+    copy — no sandbox interaction at all — which also skips the toolchain-
+    install disk cost (~5GB measured: Go/Rust/Node/Terraform/buf, purely
+    to index repos the corpus-wide graph already has).
+    """
+    corpus_sqlite = _corpus_graph_path()
+    if corpus_sqlite is None:
+        return False
+    try:
+        out_dir = _resolve_out_dir()
+        (out_dir / "target").mkdir(parents=True, exist_ok=True)
+        final_sqlite = out_dir / "target" / "code_graph.sqlite"
+        shutil.copyfile(corpus_sqlite, final_sqlite)
+    except Exception as exc:  # noqa: BLE001 — fall through to local build on any failure
+        logger.warning(
+            "strix-code-graph: corpus-wide graph adoption failed (%s); "
+            "falling back to local per-target build", exc,
+        )
+        return False
+    else:
+        logger.info(
+            "strix-code-graph: adopted corpus-wide graph wholesale (%s, %d bytes) "
+            "at %s -- skipping local per-target build entirely",
+            corpus_sqlite, final_sqlite.stat().st_size, final_sqlite,
+        )
+        return True
+
+
 async def _build_and_copy_out(session: Any, subdirs: list[str]) -> None:
     """Build one SCIP index per target subtree inside the sandbox, then copy
     each SQLite file out to a runner-local dir the query tools can open. Never
     raises — a code-graph build failure must degrade to "unavailable", not
-    break the scan. A single target's failure doesn't stop the others."""
+    break the scan. A single target's failure doesn't stop the others.
+
+    Skips ALL of this — no sandbox interaction, no toolchain installs — when
+    a corpus-wide graph is available; see _adopt_corpus_graph_wholesale.
+    """
+    if _adopt_corpus_graph_wholesale():
+        return
+
     ws_root = os.environ.get("STRIX_WORKSPACE_ROOT", "/workspace")
     langs = os.environ.get("STRIX_CODE_GRAPH_LANGS", "").strip()
     # In-sandbox path of a warm Go module cache for offline scip-go resolution
@@ -216,15 +294,7 @@ async def _build_and_copy_out(session: Any, subdirs: list[str]) -> None:
             logger.warning("strix-code-graph: merge produced no index; unavailable")
             return
 
-        # Resolve the copy-out dir from the first env name a consumer set
-        # (STRIX_CODE_GRAPH_PERSIST_DIR — the pipeline's contract — then the
-        # _DIR alias), else a private tempdir. Re-export ALL names so the query
-        # tools (and any downstream) discover the same dir regardless of which
-        # they read.
-        configured = next((os.environ[n] for n in _ENV_DIRS if os.environ.get(n)), None)
-        out_dir = Path(configured or tempfile.mkdtemp(prefix="strix-code-graph-"))
-        for n in _ENV_DIRS:
-            os.environ[n] = str(out_dir)
+        out_dir = _resolve_out_dir()
         # Write to <dir>/target/ — the layout the strix-scan pipeline's harvest
         # + enrich steps expect (code_graph/target/code_graph.sqlite), matching
         # the prior fork-carried indexer. (Was <dir>/index/, which no consumer
