@@ -180,10 +180,21 @@ def _corpus_graph_path() -> Path | None:
     _adopt_corpus_graph_wholesale's docstring for why this addon never
     fetches it itself (stays AWS-free, same posture as cache.py)."""
     corpus_path = os.environ.get("STRIX_CORPUS_GRAPH_PATH", "").strip()
+    # TEMP diagnostic (WARNING level -- visible even without a "strix."-
+    # rooted logger, unlike the INFO-level messages elsewhere in this
+    # module): live-observed the env var apparently not reaching this
+    # process despite being correctly set in the GH Actions step's own
+    # env: block. Remove once root-caused.
+    logger.warning("strix-code-graph: STRIX_CORPUS_GRAPH_PATH raw env value = %r", corpus_path)
     if not corpus_path:
         return None
     p = Path(corpus_path)
-    return p if p.is_file() else None
+    if not p.is_file():
+        logger.warning(
+            "strix-code-graph: STRIX_CORPUS_GRAPH_PATH=%r set but is_file()=False", corpus_path,
+        )
+        return None
+    return p
 
 
 def _adopt_corpus_graph_wholesale() -> bool:
