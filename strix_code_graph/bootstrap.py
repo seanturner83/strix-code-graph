@@ -73,7 +73,8 @@ def enabled() -> bool:
     sole consumers are our own scan pipelines — an opt-OUT is the right default
     for us, and it removes the need to thread an enable flag through every
     caller. Set STRIX_CODE_GRAPH=0/false/no/off to disable (e.g. local dev)."""
-    return os.environ.get("STRIX_CODE_GRAPH", "1").strip().lower() not in {"0", "false", "no", "off", ""}
+    value = os.environ.get("STRIX_CODE_GRAPH", "1").strip().lower()
+    return value not in {"0", "false", "no", "off", ""}
 
 
 def register() -> bool:
