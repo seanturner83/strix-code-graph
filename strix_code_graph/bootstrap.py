@@ -180,21 +180,6 @@ def _corpus_graph_path() -> Path | None:
     _adopt_corpus_graph_wholesale's docstring for why this addon never
     fetches it itself (stays AWS-free, same posture as cache.py)."""
     corpus_path = os.environ.get("STRIX_CORPUS_GRAPH_PATH", "").strip()
-    # TEMP diagnostic: write to a plain file, NOT logging. Live-observed
-    # that not even ERROR-level output from this module ever reaches the
-    # GH Actions console log -- suspect Strix's Rich-based TUI (cursor-
-    # control ANSI escapes for its Live/Progress display) visually
-    # consumes/overwrites plain logging writes to stderr when the raw
-    # byte stream is captured flat by CI, even though logging.error()
-    # should clear setup_scan_logging's own ERROR-level stream cap.
-    # A plain file write has no such interaction. Remove once root-caused.
-    with _suppress():
-        Path("/tmp/strix_code_graph_debug.log").write_text(
-            f"STRIX_CORPUS_GRAPH_PATH raw env value = {corpus_path!r}\n"
-            f"is_file() = {Path(corpus_path).is_file() if corpus_path else 'n/a'}\n"
-            f"all STRIX_* env vars = "
-            f"{sorted(k for k in os.environ if k.startswith('STRIX_'))}\n",
-        )
     if not corpus_path:
         return None
     p = Path(corpus_path)
