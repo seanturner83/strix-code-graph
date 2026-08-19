@@ -180,21 +180,25 @@ def _corpus_graph_path() -> Path | None:
     _adopt_corpus_graph_wholesale's docstring for why this addon never
     fetches it itself (stays AWS-free, same posture as cache.py)."""
     corpus_path = os.environ.get("STRIX_CORPUS_GRAPH_PATH", "").strip()
-    # TEMP diagnostic (ERROR level -- setup_scan_logging's own stream
-    # handler is capped at ERROR unless STRIX_DEBUG=1, so WARNING/INFO from
-    # ANY logger, "strix."-rooted or not, never reaches the GH Actions
-    # console log at all -- only strix.log, a file this pipeline doesn't
-    # surface. Confirmed live: not even register()'s own "registered N
-    # code-graph tools" INFO line ever appeared in a real domain-scan run.
-    # Remove once root-caused.
-    logger.error("strix-code-graph: STRIX_CORPUS_GRAPH_PATH raw env value = %r", corpus_path)
+    # TEMP diagnostic: write to a plain file, NOT logging. Live-observed
+    # that not even ERROR-level output from this module ever reaches the
+    # GH Actions console log -- suspect Strix's Rich-based TUI (cursor-
+    # control ANSI escapes for its Live/Progress display) visually
+    # consumes/overwrites plain logging writes to stderr when the raw
+    # byte stream is captured flat by CI, even though logging.error()
+    # should clear setup_scan_logging's own ERROR-level stream cap.
+    # A plain file write has no such interaction. Remove once root-caused.
+    with _suppress():
+        Path("/tmp/strix_code_graph_debug.log").write_text(
+            f"STRIX_CORPUS_GRAPH_PATH raw env value = {corpus_path!r}\n"
+            f"is_file() = {Path(corpus_path).is_file() if corpus_path else 'n/a'}\n"
+            f"all STRIX_* env vars = "
+            f"{sorted(k for k in os.environ if k.startswith('STRIX_'))}\n",
+        )
     if not corpus_path:
         return None
     p = Path(corpus_path)
     if not p.is_file():
-        logger.error(
-            "strix-code-graph: STRIX_CORPUS_GRAPH_PATH=%r set but is_file()=False", corpus_path,
-        )
         return None
     return p
 
