@@ -180,17 +180,19 @@ def _corpus_graph_path() -> Path | None:
     _adopt_corpus_graph_wholesale's docstring for why this addon never
     fetches it itself (stays AWS-free, same posture as cache.py)."""
     corpus_path = os.environ.get("STRIX_CORPUS_GRAPH_PATH", "").strip()
-    # TEMP diagnostic (WARNING level -- visible even without a "strix."-
-    # rooted logger, unlike the INFO-level messages elsewhere in this
-    # module): live-observed the env var apparently not reaching this
-    # process despite being correctly set in the GH Actions step's own
-    # env: block. Remove once root-caused.
-    logger.warning("strix-code-graph: STRIX_CORPUS_GRAPH_PATH raw env value = %r", corpus_path)
+    # TEMP diagnostic (ERROR level -- setup_scan_logging's own stream
+    # handler is capped at ERROR unless STRIX_DEBUG=1, so WARNING/INFO from
+    # ANY logger, "strix."-rooted or not, never reaches the GH Actions
+    # console log at all -- only strix.log, a file this pipeline doesn't
+    # surface. Confirmed live: not even register()'s own "registered N
+    # code-graph tools" INFO line ever appeared in a real domain-scan run.
+    # Remove once root-caused.
+    logger.error("strix-code-graph: STRIX_CORPUS_GRAPH_PATH raw env value = %r", corpus_path)
     if not corpus_path:
         return None
     p = Path(corpus_path)
     if not p.is_file():
-        logger.warning(
+        logger.error(
             "strix-code-graph: STRIX_CORPUS_GRAPH_PATH=%r set but is_file()=False", corpus_path,
         )
         return None
